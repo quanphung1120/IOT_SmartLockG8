@@ -1,232 +1,287 @@
 #define BLYNK_TEMPLATE_ID "TMPL608a18IeD"
 #define BLYNK_TEMPLATE_NAME "ESP32G8 SmartLock"
-
 #define BLYNK_FIRMWARE_VERSION "0.1.0"
-
 #define BLYNK_PRINT Serial
-// #define BLYNK_DEBUG
-
 #define APP_DEBUG
+#define DEFAULT_PIN "123456"
 
 #include <Arduino.h>
-#include <LittleFS.h>
 #include <BlynkEdgent.h>
 #include <ESP32Servo.h>
-#include "ServoLock.h"
-#include "DisplayManager.h"
-#include "KeypadHandler.h"
+#include <Keypad.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#include <Wire.h>
 
-// FreeRTOS includes
+#include <mutex>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-// DisplayManager setup
-DisplayManager display(0x27, 16, 2); // LCD address 0x27, 16 cols, 2 rows
+// HARDWARE CONFIG
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+std::mutex displayMutex;
+Servo lockServo;
+Preferences prefs;
 
-// Servo setup
-const int SERVO_PIN = 13;                   // GPIO pin for servo control
-ServoLock doorLock(SERVO_PIN, 0, 90, 5000); // Pin, lock position, unlock position, unlock duration
+// DISPLAY CONSTANTS
+const unsigned long BACKLIGHT_TIMEOUT = 30000;  // 30 seconds timeout
+unsigned long lastDisplayActivity = 0;
+bool backlightEnabled = true;
 
-// Keypad pins
-const uint8_t rowPins[4] = {14, 27, 26, 25}; // GIOP14, GIOP27, GIOP26, GIOP25
-const uint8_t colPins[4] = {33, 32, 18, 19}; // GIOP33, GIOP32, GIOP18, GIOP19
+// PIN CONFIG
+const int SERVO_PIN = 13;
+const uint8_t rowPins[4] = {14, 27, 26, 25};
+const uint8_t colPins[4] = {33, 32, 18, 19};
+char keyMap[4][4] = {{'1', '2', '3', 'A'},
+                     {'4', '5', '6', 'B'},
+                     {'7', '8', '9', 'C'},
+                     {'*', '0', '#', 'D'}};
 
-// Create KeypadHandler instance
-KeypadHandler keypadHandler(display, doorLock, rowPins, colPins);
+// CONSTANTS
+const int LOCK_POSITION = 0;
+const int UNLOCK_POSITION = 90;
+const unsigned long UNLOCK_DURATION = 5000;
+const uint8_t PASSCODE_LENGTH = 6;
+const unsigned long KEYPAD_TIMEOUT = 30000;
 
-// Default PIN if file doesn't exist
-const String DEFAULT_PIN = "123456";
-
-// Define task handles
+// STATE VARIABLES
+Keypad keypad =
+    Keypad(makeKeymap(keyMap), (byte *)rowPins, (byte *)colPins, 4, 4);
+char currentPasscode[PASSCODE_LENGTH + 1] = {0};
+int passcodeIndex = 0;
+unsigned long lastKeyPressTime = 0;
+String storedPin;
+bool isLocked = true;
 TaskHandle_t keypadTaskHandle = NULL;
 
-bool isValidPin(const String &pin)
-{
-  // Check length (must be exactly 6 characters)
-  if (pin.length() != 6)
-  {
-    Serial.println("PIN validation failed: Invalid length");
-    return false;
-  }
+// DISPLAY FUNCTIONS
+void displayUpdate(uint8_t col, uint8_t row, const String &text,
+                   bool clearFirst = false) {
+    std::lock_guard<std::mutex> lock(displayMutex);
+    if (clearFirst)
+        lcd.clear();
+    lcd.setCursor(col, row);
+    lcd.print(text);
 
-  // Check if PIN contains only digits
-  for (int i = 0; i < pin.length(); i++)
-  {
-    if (!isdigit(pin.charAt(i)))
-    {
-      Serial.println("PIN validation failed: Non-digit character found");
-      return false;
+    // Update activity timestamp and ensure backlight is on
+    lastDisplayActivity = millis();
+    if (!backlightEnabled) {
+        lcd.backlight();
+        backlightEnabled = true;
     }
-  }
-  // If all checks pass, PIN is valid
-  Serial.println("PIN validation passed");
-  return true;
 }
 
-String readPinFromFile()
-{
-  if (!LittleFS.begin(true))
-  {
-    Serial.println("LittleFS Mount Failed. Using default PIN.");
-    return DEFAULT_PIN;
-  }
+void displayMessage(const String &line1, const String &line2 = "",
+                    uint16_t displayTime = 0) {
+    std::lock_guard<std::mutex> lock(displayMutex);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(line1);
 
-  // Check if pin file exists
-  if (!LittleFS.exists("/pin.txt"))
-  {
-    // Create file with default PIN
-    File pinFile = LittleFS.open("/pin.txt", FILE_WRITE);
-    if (pinFile)
-    {
-      pinFile.print(DEFAULT_PIN);
-      pinFile.close();
-      Serial.println("Created pin.txt with default PIN");
+    if (line2.length() > 0) {
+        lcd.setCursor(0, 1);
+        lcd.print(line2);
     }
-    else
-    {
-      Serial.println("Failed to create pin.txt");
+
+    // Update activity timestamp and ensure backlight is on
+    lastDisplayActivity = millis();
+    if (!backlightEnabled) {
+        lcd.backlight();
+        backlightEnabled = true;
     }
-    return DEFAULT_PIN;
-  }
 
-  // Read existing PIN
-  File pinFile = LittleFS.open("/pin.txt", FILE_READ);
-  if (!pinFile)
-  {
-    Serial.println("Failed to open pin file. Using default PIN.");
-    return DEFAULT_PIN;
-  }
-
-  String storedPin = pinFile.readStringUntil('\n');
-  pinFile.close();
-
-  storedPin.trim(); // Remove any whitespace
-
-  // Validate PIN format and security
-  if (!isValidPin(storedPin))
-  {
-    Serial.println("Invalid PIN format in file. Using default PIN.");
-    return DEFAULT_PIN;
-  }
-
-  Serial.println("PIN loaded successfully");
-  return storedPin;
+    if (displayTime > 0)
+        delay(displayTime);
 }
 
-bool changePin(const String &newPin)
-{
-  // First validate the new PIN
-  if (!isValidPin(newPin))
-  {
-    Serial.println("Cannot change PIN: New PIN is invalid");
-    return false;
-  }
-
-  // Write new PIN to file
-  File pinFile = LittleFS.open("/pin.txt", FILE_WRITE);
-  if (!pinFile)
-  {
-    Serial.println("Failed to open pin file for writing. PIN not changed.");
-    return false;
-  }
-
-  pinFile.print(newPin);
-  pinFile.close();
-  Serial.println("PIN changed successfully");
-  return true;
+void setBacklight(bool on) {
+    std::lock_guard<std::mutex> lock(displayMutex);
+    on ? lcd.backlight() : lcd.noBacklight();
+    backlightEnabled = on;
 }
 
-// Keypad task function - runs on core 1
-void keypadTask(void *parameter)
-{
-  for (;;)
-  {
-    keypadHandler.processKeyInput();
-    vTaskDelay(50 / portTICK_PERIOD_MS);
-  }
+// SERVO FUNCTIONS
+void setLockPosition(bool lock) {
+    lockServo.write(lock ? LOCK_POSITION : UNLOCK_POSITION);
+    isLocked = lock;
+    Serial.println(lock ? "Door locked" : "Door unlocked");
 }
 
-BLYNK_WRITE(V0)
-{
-  // Handle Blynk button press to unlock the door
-  if (param.asInt())
-  {
-    display.showMessage("Door Unlocked", "Blynk Command", 0);
-    doorLock.unlockTemporarily();
-
-    keypadHandler.clearPasscodeDisplay(); // Clear passcode display after unlocking
-  }
+void unlockTemporarily() {
+    setLockPosition(false);  // unlock
+    delay(UNLOCK_DURATION);
+    setLockPosition(true);  // lock
 }
 
-BLYNK_WRITE(V1)
-{
-  String newPin = param.asStr();
-  Serial.println("New PIN received from Blynk: " + newPin);
-
-  if (changePin(newPin))
-  {
-    // Update the keypadHandler with the new PIN
-    keypadHandler.init(newPin);
-    display.showMessage("PIN Changed", "Successfully", 4000);
-  }
-  else
-  {
-    display.showMessage("PIN Change", "Failed", 3000);
-  }
-  keypadHandler.clearPasscodeDisplay();
+// PIN MANAGEMENT
+bool isValidPin(const String &pin) {
+    if (pin.length() != 6)
+        return false;
+    for (char c : pin)
+        if (!isdigit(c))
+            return false;
+    return true;
 }
 
-void setup()
-{
+String loadPin() {
+    prefs.begin("smartlock", true);
+    String pin = prefs.getString("pin", DEFAULT_PIN);
+    prefs.end();
 
-  Serial.begin(115200);
-  delay(300);
-
-  if (!LittleFS.begin(true))
-  {
-    Serial.println("LittleFS Mount Failed");
-    return;
-  }
-  else
-  {
-    Serial.println("Little FS Mounted Successfully");
-  }
-
-  // Setup the LCD
-  display.init();
-
-  delay(300);
-  // Display initial message
-  display.showMessage("Initializing...", "Please wait");
-
-  // Initialize BlynkEdgent
-  BlynkEdgent.begin();
-  delay(300);
-
-  // Initialize the servo lock
-  doorLock.init();
-  delay(300);
-
-  // Read PIN from file and initialize keypad handler
-  String pin = readPinFromFile();
-  keypadHandler.init(pin);
-  delay(300);
-
-  // Create Keypad task on core 1
-  xTaskCreatePinnedToCore(
-      keypadTask,        /* Function to implement the task */
-      "KeypadTask",      /* Name of the task */
-      4096,              /* Stack size in words */
-      NULL,              /* Task input parameter */
-      1,                 /* Priority of the task */
-      &keypadTaskHandle, /* Task handle */
-      1                  /* Core where the task should run */
-  );
-  Serial.println("Smart Lock system initialized");
+    return isValidPin(pin) ? pin : DEFAULT_PIN;
 }
 
-void loop()
-{
-  BlynkEdgent.run();
-  delay(1000);
+bool savePin(const String &newPin) {
+    if (!isValidPin(newPin))
+        return false;
+
+    prefs.begin("smartlock", false);
+    prefs.putString("pin", newPin);
+    prefs.end();
+
+    storedPin = newPin;
+    return true;
+}
+
+// KEYPAD FUNCTIONS
+void resetPasscodeEntry() {
+    passcodeIndex = 0;
+    memset(currentPasscode, 0, sizeof(currentPasscode));
+    displayUpdate(0, 0, "Enter Passcode:", true);
+    displayUpdate(5, 1, "______");
+}
+
+void processKeypadInput() {
+    // Check for timeout
+    if (passcodeIndex > 0 && millis() - lastKeyPressTime >= KEYPAD_TIMEOUT) {
+        displayMessage("Timeout", "Input cleared", 1500);
+        resetPasscodeEntry();
+        setBacklight(false);
+        return;
+    }
+
+    char key = keypad.getKey();
+    if (!key)
+        return;
+
+    setBacklight(true);
+    lastKeyPressTime = millis();
+
+    // Ignore input when door is unlocked
+    if (!isLocked)
+        return;
+
+    // Handle digit keys (0-9)
+    if (isdigit(key) && passcodeIndex < PASSCODE_LENGTH) {
+        currentPasscode[passcodeIndex] = key;
+        displayUpdate(5 + passcodeIndex, 1, String(key));
+        passcodeIndex++;
+
+        if (passcodeIndex == PASSCODE_LENGTH) {
+            displayUpdate(0, 0, "Press # to verify", true);
+        }
+        return;
+    }
+
+    // Handle backspace (*)
+    if (key == '*' && passcodeIndex > 0) {
+        passcodeIndex--;
+        currentPasscode[passcodeIndex] = 0;
+        displayUpdate(5 + passcodeIndex, 1, "_");
+        return;
+    }
+
+    // Handle enter key (#)
+    if (key == '#') {
+        if (String(currentPasscode) == storedPin) {
+            // Success - unlock door
+            setLockPosition(false);
+            displayMessage("Access Granted!", "Door Unlocked", 2000);
+
+            // Auto-lock countdown
+            displayUpdate(0, 0, "Auto-locking in:", true);
+            for (int i = 5; i >= 0; i--) {
+                displayUpdate(0, 1, String(i) + " seconds");
+                delay(1000);
+            }
+
+            setLockPosition(true);
+            displayMessage("Door Locked", "", 1000);
+        } else {
+            // Failed attempt
+            Blynk.logEvent("access_denied");
+            displayMessage("Access Denied!", "", 2000);
+        }
+        resetPasscodeEntry();
+    }
+}
+
+// KEYPAD TASK
+void keypadTask(void *parameter) {
+    for (;;) {
+        // Check if backlight should be turned off
+        if (backlightEnabled &&
+            (millis() - lastDisplayActivity >= BACKLIGHT_TIMEOUT)) {
+            setBacklight(false);
+        }
+
+        processKeypadInput();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+// BLYNK HANDLERS
+BLYNK_WRITE(V0) {
+    if (param.asInt()) {
+        displayMessage("Door Unlocked", "Blynk Command");
+        unlockTemporarily();
+        resetPasscodeEntry();
+    }
+}
+
+BLYNK_WRITE(V1) {
+    String newPin = param.asStr();
+    if (savePin(newPin)) {
+        displayMessage("PIN Changed", "Successfully", 4000);
+    } else {
+        displayMessage("PIN Change", "Failed", 3000);
+    }
+    resetPasscodeEntry();
+}
+
+// SETUP AND LOOP
+void setup() {
+    Serial.begin(115200);
+
+    // Initialize hardware
+    Wire.begin();
+    lcd.init();
+    lcd.clear();
+    lcd.backlight();
+
+    ESP32PWM::allocateTimer(0);
+    lockServo.attach(SERVO_PIN);
+    setLockPosition(true);
+
+    // Load PIN from preferences
+    storedPin = loadPin();
+    Serial.println("Current PIN: " + storedPin);
+
+    // Initialize system
+    displayMessage("Initializing...", "Please wait");
+    BlynkEdgent.begin();
+
+    // Prepare keypad
+    resetPasscodeEntry();
+    lastKeyPressTime = millis();
+
+    // Start keypad task
+    xTaskCreatePinnedToCore(keypadTask, "KeypadTask", 4096, NULL, 1,
+                            &keypadTaskHandle, 1);
+}
+
+void loop() {
+    BlynkEdgent.run();
+    delay(10);  // Small delay to prevent CPU hogging
 }
