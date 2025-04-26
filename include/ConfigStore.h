@@ -136,10 +136,11 @@ bool config_save() {
     }
 }
 
-bool pinReset() {
+bool pin_reset() {
     Preferences prefs;
     if (prefs.begin("smartlock", false)) {    // writeable
         prefs.putString("pin", DEFAULT_PIN);  // Reset to default PIN
+        prefs.end();
         DEBUG_PRINT("Pin reset to default pin");
         return true;
     } else {
@@ -156,8 +157,8 @@ bool config_init() {
 void enterResetConfig() {
     DEBUG_PRINT("Resetting configuration!");
     configStore = configDefault;
+    pin_reset();
     config_save();
-    pinReset();  // Reset the PIN to default
     BlynkState::set(MODE_WAIT_CONFIG);
 }
 
