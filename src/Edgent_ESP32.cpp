@@ -13,6 +13,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
 
+#include <atomic>
 #include <mutex>
 
 #include "freertos/FreeRTOS.h"
@@ -52,30 +53,30 @@ TaskHandle_t inputTaskHandle = NULL;
 String unlockPin;
 char currentPasscode[PASSCODE_LENGTH + 1] = {0};
 int passcodeIndex = 0;
-int failedAttempts = 0;
+int pinFailedAttempts = 0;
+int fingerFailedAttempts = 0;
 bool isLocked = true;
 bool backlightEnabled = true;
 bool autoLockPending = false;
-bool isRegistering = false;
+
 unsigned long autoLockTime = 0;
 unsigned long lockoutUntil = 0;
 unsigned long lastKeyPressTime = 0;
-unsigned long lastDisplayActivity = 0;
+
+unsigned long lastPinFailTime = 0;
+unsigned long lastFingerFailTime = 0;
+const unsigned long ATTEMPT_RESET_TIME = 120000;  // 2 minutes in milliseconds
+
+// Using atomic because this variable is accessed from multiple threads
+std::atomic<bool> isRegistering{false};
 
 // Display functions
 void displayUpdate(uint8_t col, uint8_t row, const String &text,
                    bool clearFirst = false) {
     std::lock_guard<std::mutex> lock(displayMutex);
-    if (clearFirst)
-        lcd.clear();
+    if (clearFirst) lcd.clear();
     lcd.setCursor(col, row);
     lcd.print(text);
-
-    lastDisplayActivity = millis();
-    if (!backlightEnabled) {
-        lcd.backlight();
-        backlightEnabled = true;
-    }
 }
 
 void displayMessage(const String &line1, const String &line2 = "",
@@ -90,27 +91,21 @@ void displayMessage(const String &line1, const String &line2 = "",
         lcd.print(line2);
     }
 
-    lastDisplayActivity = millis();
-    if (!backlightEnabled) {
-        lcd.backlight();
-        backlightEnabled = true;
-    }
-
-    if (displayTime > 0)
-        delay(displayTime);
-}
-
-void setBacklight(bool on) {
-    std::lock_guard<std::mutex> lock(displayMutex);
-    on ? lcd.backlight() : lcd.noBacklight();
-    backlightEnabled = on;
+    if (displayTime > 0) delay(displayTime);
 }
 
 // Lock control functions
+unsigned long lastServoCommandTime = 0;
+const unsigned long SERVO_COMMAND_DEBOUNCE = 500;  // 500ms between commands
+
+// Update setLockPosition
 void setLockPosition(bool lock) {
-    lockServo.write(lock ? LOCK_POSITION : UNLOCK_POSITION);
-    isLocked = lock;
-    Serial.println(lock ? "Door locked" : "Door unlocked");
+    // Only move if state is changing
+    if (isLocked != lock) {
+        lockServo.write(lock ? LOCK_POSITION : UNLOCK_POSITION);
+        isLocked = lock;
+        Serial.println(lock ? "Door locked" : "Door unlocked");
+    }
 }
 
 void unlockTemporarily() {
@@ -122,17 +117,13 @@ void unlockTemporarily() {
     displayUpdate(0, 1, "Locks in: " + String(UNLOCK_DURATION / 1000) + "s");
 }
 
-bool isLockoutActive() {
-    return millis() < lockoutUntil;
-}
+bool isLockoutActive() { return millis() < lockoutUntil; }
 
 // PIN management
 bool isValidPin(const String &pin) {
-    if (pin.length() != 6)
-        return false;
+    if (pin.length() != 6) return false;
     for (char c : pin)
-        if (!isdigit(c))
-            return false;
+        if (!isdigit(c)) return false;
     return true;
 }
 
@@ -145,8 +136,7 @@ String loadPin() {
 }
 
 bool savePin(const String &newPin) {
-    if (!isValidPin(newPin))
-        return false;
+    if (!isValidPin(newPin)) return false;
 
     if (prefs.begin("smartlock", false)) {
         prefs.putString("pin", newPin);
@@ -161,6 +151,15 @@ bool savePin(const String &newPin) {
     }
 }
 
+void sendBlynkEvent(const char *eventName, const char *eventDescription) {
+    if (Blynk.connected()) {
+        Blynk.logEvent(eventName, eventDescription);
+        Serial.println("Event sent: " + String(eventName));
+    } else {
+        Serial.println("Blynk offline, can't send event: " + String(eventName));
+    }
+}
+
 // Keypad functions
 void resetPasscodeEntry() {
     passcodeIndex = 0;
@@ -169,18 +168,16 @@ void resetPasscodeEntry() {
     displayUpdate(5, 1, "______");
 }
 
-void processKeypadInput() {
+bool processKeypadInput() {
     // Check for timeout
     if (passcodeIndex > 0 && millis() - lastKeyPressTime >= KEYPAD_TIMEOUT) {
         displayMessage("Timeout", "Input cleared", 1500);
         resetPasscodeEntry();
-        setBacklight(false);
-        return;
+        return false;
     }
 
     char key = keypad.getKey();
-    if (!key)
-        return;
+    if (!key) return false;
 
     lastKeyPressTime = millis();
 
@@ -193,7 +190,7 @@ void processKeypadInput() {
         if (passcodeIndex == PASSCODE_LENGTH) {
             displayUpdate(0, 0, "Press # to verify", false);
         }
-        return;
+        return false;
     }
 
     // Handle backspace (*)
@@ -201,55 +198,41 @@ void processKeypadInput() {
         passcodeIndex--;
         currentPasscode[passcodeIndex] = 0;
         displayUpdate(5 + passcodeIndex, 1, "_");
-        return;
+        return false;
     }
 
     // Handle enter key (#)
     if (key == '#' && passcodeIndex == PASSCODE_LENGTH) {
-        if (millis() < lockoutUntil) {
-            unsigned long remainingSecs = (lockoutUntil - millis()) / 1000;
-            displayMessage("Locked Out", String(remainingSecs) + "s remaining");
-            delay(2000);
-            resetPasscodeEntry();
-            return;
-        }
-
         if (String(currentPasscode) == unlockPin) {
-            if (Blynk.connected()) {
-                Blynk.logEvent("access_granted", "Access granted via passcode");
-            }
-
-            failedAttempts = 0;
+            pinFailedAttempts = 0;
+            sendBlynkEvent("access_granted", "Access granted via passcode");
             unlockTemporarily();
             displayMessage("Access Granted!", "Door Unlocked", 2000);
             resetPasscodeEntry();
+            return true;
         } else {
-            // Failed attempt
-            failedAttempts++;
+            pinFailedAttempts++;
+            lastPinFailTime = millis();
 
-            if (failedAttempts >= 3) {
-                if (Blynk.connected()) {
-                    Blynk.logEvent("alarm_sent",
-                                   "Access denied - 3 failed attempts");
-                }
+            if (pinFailedAttempts >= 3) {
+                sendBlynkEvent("send_alarm",
+                               "Access denied, too many attempts");
 
                 displayMessage("Too Many Attempts");
                 lockoutUntil = millis() + LOCKOUT_DURATION;
-
-                for (int i = 60; i >= 0 && millis() < lockoutUntil; i--) {
-                    displayUpdate(0, 1, "Locked for " + String(i) + "s");
-                    vTaskDelay(1000 / portTICK_PERIOD_MS);
-                }
-
-                failedAttempts = 0;
+                pinFailedAttempts = 0;
             } else {
+                sendBlynkEvent("access_denied", "Access denied via passcode");
                 displayMessage("Access Denied!",
-                               String(3 - failedAttempts) + " attempts left",
+                               String(3 - pinFailedAttempts) + " attempts left",
                                2000);
             }
             resetPasscodeEntry();
+            return false;
         }
     }
+
+    return false;
 }
 
 // Fingerprint functions
@@ -268,16 +251,13 @@ uint8_t findAvailableFingerID() {
 
 int getFingerprintIDez() {
     uint8_t p = finger.getImage();
-    if (p != FINGERPRINT_OK)
-        return -1;
+    if (p != FINGERPRINT_OK) return -1;
 
     p = finger.image2Tz();
-    if (p != FINGERPRINT_OK)
-        return -1;
+    if (p != FINGERPRINT_OK) return -1;
 
     p = finger.fingerFastSearch();
-    if (p != FINGERPRINT_OK)
-        return -2;
+    if (p != FINGERPRINT_OK) return -2;
 
     Serial.print("Found ID #");
     Serial.print(finger.fingerID);
@@ -369,7 +349,7 @@ bool getFingerprintEnroll() {
     while (p != FINGERPRINT_NOFINGER && attemptCount < MAX_ATTEMPTS) {
         p = finger.getImage();
         if (p != FINGERPRINT_NOFINGER) {
-            delay(200);
+            delay(1000);
             attemptCount++;
         }
 
@@ -478,21 +458,61 @@ bool getFingerprintEnroll() {
     }
 }
 
+void handleFingerprint() {
+    if (!isRegistering && isLocked && !isLockoutActive()) {
+        int fingerID = getFingerprintIDez();
+
+        while (finger.getImage() != FINGERPRINT_NOFINGER) {
+            displayMessage("Remove your", "finger to process");
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+
+        if (fingerID > 0) {
+            // Wait for finger removal before unlocking
+            fingerFailedAttempts = 0;
+            displayMessage("Access Granted!", "Door Unlocked", 2000);
+            unlockTemporarily();
+
+            sendBlynkEvent("access_granted", "Access granted via fingerprint");
+        } else if (fingerID == -2) {
+            sendBlynkEvent("access_denied", "Access denied via fingerprint");
+
+            displayMessage("Access Denied!", "", 2000);
+            fingerFailedAttempts++;
+            resetPasscodeEntry();
+
+            if (fingerFailedAttempts >= 5) {
+                sendBlynkEvent("send_alarm",
+                               "Access denied, too many attempts");
+
+                displayMessage("Too Many Attempts", "Locking out", 2000);
+                lockoutUntil = millis() + LOCKOUT_DURATION;
+                fingerFailedAttempts = 0;
+            }
+        }
+    }
+}
+
 // Main input task
 void inputTask(void *parameter) {
-    Serial.println("inputTask() running on core " + String(xPortGetCoreID()));
+    // Serial.println("inputTask() running on core " +
+    // String(xPortGetCoreID()));
     int fingerScanCounter = 0;
     int pinStateCurrent = digitalRead(MOVEMENT_PIN);
     int pinStatePrevious = pinStateCurrent;
+    long lastDisplayedTime = -1;
 
     for (;;) {
-        // Check backlight timeout
-        if (backlightEnabled &&
-            (millis() - lastDisplayActivity >= BACKLIGHT_TIMEOUT)) {
-            setBacklight(false);
+        if (isLockoutActive()) {
+            unsigned long currentTime = millis();
+            unsigned long remainingSecs = (lockoutUntil - currentTime) / 1000;
+            displayMessage("System Locked",
+                           String(remainingSecs) + "s remaining");
+
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            continue;
         }
 
-        // Auto-lock handling
         if (autoLockPending) {
             // Check motion sensor
             pinStatePrevious = pinStateCurrent;
@@ -507,61 +527,56 @@ void inputTask(void *parameter) {
 
             // Update countdown display
             long remainingTime = (autoLockTime - millis()) / 1000;
-            static long lastDisplayedTime = -1;
             if (remainingTime != lastDisplayedTime && remainingTime >= 0) {
                 lastDisplayedTime = remainingTime;
-                displayUpdate(0, 1, "Locks in: " + String(remainingTime) + "s",
-                              false);
+                displayMessage("System Locked",
+                               String(remainingTime) + "s remaining");
             }
 
             if (!autoLockPending) {
+                // Reset display if the door is locked
                 lastDisplayedTime = -1;
             }
         }
 
-        // Check if it's time to auto-lock
+        // Check if it's time to auto close the door
         if (autoLockPending && millis() >= autoLockTime) {
             setLockPosition(true);
             autoLockPending = false;
             displayMessage("Door Locked", "Auto-lock complete", 1000);
             resetPasscodeEntry();
+            vTaskDelay(1000);
+        }
+
+        if (pinFailedAttempts > 0 &&
+            (millis() - lastPinFailTime) > ATTEMPT_RESET_TIME) {
+            Serial.println("PIN failed attempts reset after 2 minutes");
+            pinFailedAttempts = 0;
+        }
+
+        // Reset fingerprint attempts if needed
+        if (fingerFailedAttempts > 0 &&
+            (millis() - lastFingerFailTime) > ATTEMPT_RESET_TIME) {
+            Serial.println("Fingerprint failed attempts reset after 2 minutes");
+            fingerFailedAttempts = 0;
         }
 
         // Process keypad input
-        if (!isLockoutActive()) {
-            processKeypadInput();
+        if (!isLocked) {
+            continue;
+        }
+
+        if (processKeypadInput()) {
+            continue;  // Successful entry, skip to next iteration
         }
 
         // Check fingerprint sensor (every 5 iterations)
         fingerScanCounter++;
         if (fingerScanCounter >= 5) {
             fingerScanCounter = 0;
-
-            if (!isRegistering && !isLockoutActive() && isLocked) {
-                int fingerID = getFingerprintIDez();
-
-                if (fingerID > 0) {
-                    // Wait for finger removal before unlocking
-                    while (finger.getImage() != FINGERPRINT_NOFINGER) {
-                        displayMessage("Remove your", "finger to open");
-                        vTaskDelay(100 / portTICK_PERIOD_MS);
-                    }
-
-                    if (Blynk.connected()) {
-                        Blynk.logEvent("access_granted",
-                                       "Access granted via fingerprint");
-                    }
-                    displayMessage("Access Granted!", "Door Unlocked", 2000);
-                    failedAttempts = 0;
-                    unlockTemporarily();
-                } else if (fingerID == -2) {
-                    displayMessage("Access Denied!", "", 2000);
-                    resetPasscodeEntry();
-                }
-            }
+            handleFingerprint();
         }
-
-        vTaskDelay(80 / portTICK_PERIOD_MS);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
@@ -577,6 +592,12 @@ BLYNK_WRITE(V0) {
 
 BLYNK_WRITE(V1) {
     String newPin = param.asStr();
+
+    if (!isValidPin(newPin)) {
+        // return the message to blynk app
+        return;
+    }
+
     if (savePin(newPin)) {
         displayMessage("PIN Changed", "Successfully", 4000);
         // // Send confirmation to Blynk
@@ -598,7 +619,7 @@ BLYNK_WRITE(V2) {
         isRegistering = false;
 
         if (success) {
-            displayMessage("Fingerprint", "Registered", 2000);
+            displayMessage("Registration", "Successfully", 2000);
         } else {
             displayMessage("Registration", "Failed", 2000);
         }
@@ -626,16 +647,9 @@ void setup() {
     displayMessage("Initializing...", "Please wait");
 
     // Setup servo
-    ESP32PWM::allocateTimer(0);
-    lockServo.attach(SERVO_PIN);
-    setLockPosition(true);
-
-    // Load PIN from preferences
-    unlockPin = loadPin();
-    Serial.println("Current PIN: " + unlockPin);
-
-    // Initialize Blynk
-    BlynkEdgent.begin();
+    lockServo.attach(SERVO_PIN);     // Min/Max pulse width
+    delay(3000);                     // Allow time for servo to initialize
+    lockServo.write(LOCK_POSITION);  // Start in locked positio
 
     // Setup I/O and interfaces
     pinMode(MOVEMENT_PIN, INPUT);
@@ -651,6 +665,13 @@ void setup() {
     } else {
         Serial.println("Fingerprint sensor not found!");
     }
+
+    // Load PIN from preferences
+    unlockPin = loadPin();
+    Serial.println("Current PIN: " + unlockPin);
+
+    // Initialize Blynk
+    BlynkEdgent.begin();
 
     // Create input handling task
     xTaskCreatePinnedToCore(inputTask, "InputTask", 4096, NULL, 1,
