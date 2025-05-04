@@ -37,8 +37,8 @@ char keyMap[4][4] = {{'1', '2', '3', 'A'},
                      {'*', '0', '#', 'D'}};
 
 // System constants
-const int LOCK_POSITION = 0;
-const int UNLOCK_POSITION = 90;
+const int LOCK_POSITION = 90;
+const int UNLOCK_POSITION = 0;
 const unsigned long UNLOCK_DURATION = 15000;  // 15 seconds for auto-lock
 const unsigned long LOCKOUT_DURATION =
     60000;  // 1 minute lockout after 3 failures
@@ -168,7 +168,7 @@ void resetPasscodeEntry() {
     displayUpdate(5, 1, "______");
 }
 
-bool processKeypadInput() {
+bool handleKeypadInput() {
     // Check for timeout
     if (passcodeIndex > 0 && millis() - lastKeyPressTime >= KEYPAD_TIMEOUT) {
         displayMessage("Timeout", "Input cleared", 1500);
@@ -240,8 +240,8 @@ uint8_t findAvailableFingerID() {
     finger.getTemplateCount();
 
     for (uint8_t id = 1; id < 128; id++) {
-        uint8_t p = finger.loadModel(id);
-        if (p == FINGERPRINT_BADLOCATION) {
+        uint8_t p = finger.fingerSearch(id);
+        if (p == FINGERPRINT_NOTFOUND) {
             return id;  // This ID is available
         }
     }
@@ -280,7 +280,6 @@ bool getFingerprintEnroll() {
     displayMessage("Enrolling ID #" + String(id), "Place finger");
     Serial.println("Waiting for valid finger to enroll as #" + String(id));
 
-    // First image capture with timeout
     attemptCount = 0;
     while (p != FINGERPRINT_OK && attemptCount < MAX_ATTEMPTS) {
         p = finger.getImage();
@@ -458,52 +457,74 @@ bool getFingerprintEnroll() {
     }
 }
 
-void handleFingerprint() {
-    if (!isRegistering && isLocked && !isLockoutActive()) {
-        int fingerID = getFingerprintIDez();
+bool handleFingerprint() {
+    // Early return for conditions that prevent fingerprint processing
+    if (isRegistering.load() || !isLocked || isLockoutActive()) {
+        return false;
+    }
 
-        while (finger.getImage() != FINGERPRINT_NOFINGER) {
-            displayMessage("Remove your", "finger to process");
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-        }
+    // First check if there's a finger
+    int fingerID = getFingerprintIDez();
+    if (fingerID == -1) {
+        return false;  // No finger detected
+    }
 
-        if (fingerID > 0) {
-            // Wait for finger removal before unlocking
+    // Show message once and wait for finger removal
+    displayMessage("Remove your", "finger to process");
+    while (finger.getImage() != FINGERPRINT_NOFINGER) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+
+    // Process result
+    if (fingerID > 0) {
+        // Success - valid fingerprint
+        fingerFailedAttempts = 0;
+        displayMessage("Access Granted!", "Door Unlocked", 2000);
+        unlockTemporarily();
+        sendBlynkEvent("access_granted", "Access granted via fingerprint");
+        return true;
+    } else if (fingerID == -2) {
+        // Failed match
+        fingerFailedAttempts++;
+        lastFingerFailTime = millis();
+
+        // Handle too many failed attempts
+        if (fingerFailedAttempts >= 5) {
+            sendBlynkEvent("send_alarm", "Access denied, too many attempts");
+            displayMessage("Too Many Attempts", "Locking out", 2000);
+            lockoutUntil = millis() + LOCKOUT_DURATION;
             fingerFailedAttempts = 0;
-            displayMessage("Access Granted!", "Door Unlocked", 2000);
-            unlockTemporarily();
-
-            sendBlynkEvent("access_granted", "Access granted via fingerprint");
-        } else if (fingerID == -2) {
+        } else {
             sendBlynkEvent("access_denied", "Access denied via fingerprint");
-
-            displayMessage("Access Denied!", "", 2000);
-            fingerFailedAttempts++;
-            resetPasscodeEntry();
-
-            if (fingerFailedAttempts >= 5) {
-                sendBlynkEvent("send_alarm",
-                               "Access denied, too many attempts");
-
-                displayMessage("Too Many Attempts", "Locking out", 2000);
-                lockoutUntil = millis() + LOCKOUT_DURATION;
-                fingerFailedAttempts = 0;
-            }
+            displayMessage("Access Denied!",
+                           String(5 - fingerFailedAttempts) + " attempts left",
+                           2000);
         }
+        resetPasscodeEntry();
+    }
+
+    return false;
+}
+
+void blynkVirtualWrite(const int pin, String value) {
+    if (WiFi.status() == WL_CONNECTED && Blynk.connected()) {
+        Blynk.virtualWrite(pin, value);
+    } else {
+        Serial.println("Blynk offline, can't send event: " + String(pin));
     }
 }
 
 // Main input task
 void inputTask(void *parameter) {
-    // Serial.println("inputTask() running on core " +
-    // String(xPortGetCoreID()));
     int fingerScanCounter = 0;
     int pinStateCurrent = digitalRead(MOVEMENT_PIN);
     int pinStatePrevious = pinStateCurrent;
     long lastDisplayedTime = -1;
+    bool wasLocked = false;
 
     for (;;) {
         if (isLockoutActive()) {
+            wasLocked = true;
             unsigned long currentTime = millis();
             unsigned long remainingSecs = (lockoutUntil - currentTime) / 1000;
             displayMessage("System Locked",
@@ -513,39 +534,40 @@ void inputTask(void *parameter) {
             continue;
         }
 
+        if (wasLocked) {
+            // Just transitioned from locked to unlocked - update display
+            wasLocked = false;
+            displayMessage("Lockout Ended", "System Available", 2000);
+            resetPasscodeEntry();  // This will show the "Enter Passcode" screen
+        }
+
         if (autoLockPending) {
-            // Check motion sensor
+            unsigned long currentTime = millis();
+
             pinStatePrevious = pinStateCurrent;
             pinStateCurrent = digitalRead(MOVEMENT_PIN);
 
             if (pinStatePrevious == LOW && pinStateCurrent == HIGH) {
                 Serial.println("Motion detected!");
-                if (!isLocked && autoLockPending) {
-                    autoLockTime = millis() + UNLOCK_DURATION;
+                autoLockTime = currentTime + UNLOCK_DURATION;
+                delay(200);  // Debounce delay
+            }
+
+            if (currentTime >= autoLockTime) {
+                // Time to lock
+                setLockPosition(true);
+                autoLockPending = false;
+                displayMessage("Door Locked", "Auto-lock complete", 1000);
+                resetPasscodeEntry();
+                lastDisplayedTime = -1;
+            } else {
+                long remainingTime = (autoLockTime - currentTime) / 1000;
+                if (remainingTime != lastDisplayedTime && remainingTime >= 0) {
+                    lastDisplayedTime = remainingTime;
+                    displayMessage("Auto-Lock in:",
+                                   String(remainingTime) + "s");
                 }
             }
-
-            // Update countdown display
-            long remainingTime = (autoLockTime - millis()) / 1000;
-            if (remainingTime != lastDisplayedTime && remainingTime >= 0) {
-                lastDisplayedTime = remainingTime;
-                displayMessage("System Locked",
-                               String(remainingTime) + "s remaining");
-            }
-
-            if (!autoLockPending) {
-                // Reset display if the door is locked
-                lastDisplayedTime = -1;
-            }
-        }
-
-        // Check if it's time to auto close the door
-        if (autoLockPending && millis() >= autoLockTime) {
-            setLockPosition(true);
-            autoLockPending = false;
-            displayMessage("Door Locked", "Auto-lock complete", 1000);
-            resetPasscodeEntry();
-            vTaskDelay(1000);
         }
 
         if (pinFailedAttempts > 0 &&
@@ -554,29 +576,26 @@ void inputTask(void *parameter) {
             pinFailedAttempts = 0;
         }
 
-        // Reset fingerprint attempts if needed
         if (fingerFailedAttempts > 0 &&
             (millis() - lastFingerFailTime) > ATTEMPT_RESET_TIME) {
             Serial.println("Fingerprint failed attempts reset after 2 minutes");
             fingerFailedAttempts = 0;
         }
 
-        // Process keypad input
-        if (!isLocked) {
-            continue;
-        }
+        if (isLocked) {
+            bool keypadSuccess = handleKeypadInput();
+            if (keypadSuccess || isLockoutActive()) {
+                vTaskDelay(50 / portTICK_PERIOD_MS);
+                continue;
+            }
 
-        if (processKeypadInput()) {
-            continue;  // Successful entry, skip to next iteration
+            fingerScanCounter++;
+            if (fingerScanCounter >= 5) {
+                fingerScanCounter = 0;
+                handleFingerprint();
+            }
         }
-
-        // Check fingerprint sensor (every 5 iterations)
-        fingerScanCounter++;
-        if (fingerScanCounter >= 5) {
-            fingerScanCounter = 0;
-            handleFingerprint();
-        }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
@@ -600,10 +619,10 @@ BLYNK_WRITE(V1) {
 
     if (savePin(newPin)) {
         displayMessage("PIN Changed", "Successfully", 4000);
-        // // Send confirmation to Blynk
-        // Blynk.virtualWrite(V3, "PIN changed: " + String(millis()));
+        blynkVirtualWrite(V3, "Pin changed successfully");
     } else {
         displayMessage("PIN Change", "Failed", 3000);
+        blynkVirtualWrite(V3, "Pin changed failed");
     }
     resetPasscodeEntry();
 }
@@ -620,24 +639,32 @@ BLYNK_WRITE(V2) {
 
         if (success) {
             displayMessage("Registration", "Successfully", 2000);
+            blynkVirtualWrite(V4, "Fingerprint registered successfully");
         } else {
             displayMessage("Registration", "Failed", 2000);
+            blynkVirtualWrite(V4, "Fingerprint registration failed");
         }
 
         resetPasscodeEntry();
     }
 }
 
-BLYNK_WRITE(V9) {
-    if (param.asInt()) {
-        displayMessage("Clearing", "Fingerprint Data", 2000);
-        finger.emptyDatabase();
-        displayMessage("Fingerprint", "Data Cleared", 2000);
-        resetPasscodeEntry();
+BLYNK_WRITE(V6) {
+    int id = param.asInt();
+    if (id > 0) {
+        if (finger.deleteModel(id) == FINGERPRINT_OK) {
+            displayMessage("Fingerprint", "Deleted", 2000);
+            blynkVirtualWrite(V5, "Fingerprint deleted successfully");
+        } else {
+            displayMessage("Delete Failed", "Try again", 2000);
+            blynkVirtualWrite(V5, "Fingerprint deletion failed");
+        }
+    } else {
+        displayMessage("Invalid ID", "Try again", 2000);
     }
+    resetPasscodeEntry();
 }
 
-// Setup and main loop
 void setup() {
     Serial.begin(115200);
 
