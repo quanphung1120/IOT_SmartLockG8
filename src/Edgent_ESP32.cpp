@@ -1,8 +1,9 @@
 #define BLYNK_TEMPLATE_ID "TMPL608a18IeD"
-#define BLYNK_TEMPLATE_NAME "ESP32G8 SmartLock"
+#define BLYNK_TEMPLATE_NAME "EasyLock SmartDoor"
 #define BLYNK_FIRMWARE_VERSION "0.1.0"
 #define BLYNK_PRINT Serial
 #define APP_DEBUG
+
 #define DEFAULT_PIN "123456"
 
 #include <Adafruit_Fingerprint.h>
@@ -39,20 +40,22 @@ char keyMap[4][4] = {{'1', '2', '3', 'A'},
 // System constants
 const int LOCK_POSITION = 90;
 const int UNLOCK_POSITION = 0;
-const unsigned long UNLOCK_DURATION = 15000;  // 15 seconds for auto-lock
-const unsigned long LOCKOUT_DURATION =
-    60000;  // 1 minute lockout after 3 failures
-const unsigned long BACKLIGHT_TIMEOUT = 30000;  // 30 seconds for LCD backlight
-const unsigned long KEYPAD_TIMEOUT = 30000;     // 30 seconds for keypad input
+const unsigned long UNLOCK_DURATION = 15000;
+const unsigned long LOCKOUT_DURATION = 60000;
+
+// Keypad timeout
+const unsigned long KEYPAD_TIMEOUT = 30000;
+
+// PIN constants
 const uint8_t PASSCODE_LENGTH = 6;
 
 // System state
 Keypad keypad =
     Keypad(makeKeymap(keyMap), (byte *)rowPins, (byte *)colPins, 4, 4);
 TaskHandle_t inputTaskHandle = NULL;
-String unlockPin;
-char currentPasscode[PASSCODE_LENGTH + 1] = {0};
-int passcodeIndex = 0;
+
+String currentPasscode = "";
+
 int pinFailedAttempts = 0;
 int fingerFailedAttempts = 0;
 bool isLocked = true;
@@ -143,7 +146,6 @@ bool savePin(const String &newPin) {
         prefs.end();
 
         Serial.println("PIN saved: " + newPin);
-        unlockPin = newPin;
         return true;
     } else {
         Serial.println("Failed to save PIN to preferences");
@@ -151,7 +153,7 @@ bool savePin(const String &newPin) {
     }
 }
 
-void sendBlynkEvent(const char *eventName, const char *eventDescription) {
+void sendBlynkEvent(String eventName, String eventDescription) {
     if (Blynk.connected()) {
         Blynk.logEvent(eventName, eventDescription);
         Serial.println("Event sent: " + String(eventName));
@@ -160,17 +162,15 @@ void sendBlynkEvent(const char *eventName, const char *eventDescription) {
     }
 }
 
-// Keypad functions
 void resetPasscodeEntry() {
-    passcodeIndex = 0;
-    memset(currentPasscode, 0, sizeof(currentPasscode));
+    currentPasscode = "";
     displayUpdate(0, 0, "Enter Passcode:", true);
     displayUpdate(5, 1, "______");
 }
 
 bool handleKeypadInput() {
-    // Check for timeout
-    if (passcodeIndex > 0 && millis() - lastKeyPressTime >= KEYPAD_TIMEOUT) {
+    if (currentPasscode.length() > 0 &&
+        millis() - lastKeyPressTime >= KEYPAD_TIMEOUT) {
         displayMessage("Timeout", "Input cleared", 1500);
         resetPasscodeEntry();
         return false;
@@ -178,32 +178,31 @@ bool handleKeypadInput() {
 
     char key = keypad.getKey();
     if (!key) return false;
-
     lastKeyPressTime = millis();
 
-    // Handle digit keys (0-9)
-    if (isdigit(key) && passcodeIndex < PASSCODE_LENGTH) {
-        currentPasscode[passcodeIndex] = key;
-        displayUpdate(5 + passcodeIndex, 1, String(key));
-        passcodeIndex++;
+    if (isdigit(key) && currentPasscode.length() < PASSCODE_LENGTH) {
+        // Add digit to the string
+        currentPasscode += key;
+        displayUpdate(5 + currentPasscode.length() - 1, 1, String(key));
 
-        if (passcodeIndex == PASSCODE_LENGTH) {
+        if (currentPasscode.length() == PASSCODE_LENGTH) {
             displayUpdate(0, 0, "Press # to verify", false);
         }
         return false;
     }
 
     // Handle backspace (*)
-    if (key == '*' && passcodeIndex > 0) {
-        passcodeIndex--;
-        currentPasscode[passcodeIndex] = 0;
-        displayUpdate(5 + passcodeIndex, 1, "_");
+    if (key == '*' && currentPasscode.length() > 0) {
+        // Remove last character from string
+        displayUpdate(5 + currentPasscode.length() - 1, 1, "_");
+        currentPasscode.remove(currentPasscode.length() - 1);
         return false;
     }
 
     // Handle enter key (#)
-    if (key == '#' && passcodeIndex == PASSCODE_LENGTH) {
-        if (String(currentPasscode) == unlockPin) {
+    if (key == '#' && currentPasscode.length() == PASSCODE_LENGTH) {
+        // Direct string comparison
+        if (currentPasscode == loadPin()) {
             pinFailedAttempts = 0;
             sendBlynkEvent("access_granted", "Access granted via passcode");
             unlockTemporarily();
@@ -217,7 +216,6 @@ bool handleKeypadInput() {
             if (pinFailedAttempts >= 3) {
                 sendBlynkEvent("send_alarm",
                                "Access denied, too many attempts");
-
                 displayMessage("Too Many Attempts");
                 lockoutUntil = millis() + LOCKOUT_DURATION;
                 pinFailedAttempts = 0;
@@ -675,7 +673,7 @@ void setup() {
 
     // Setup servo
     lockServo.attach(SERVO_PIN);     // Min/Max pulse width
-    delay(3000);                     // Allow time for servo to initialize
+    delay(1000);                     // Allow time for servo to initialize
     lockServo.write(LOCK_POSITION);  // Start in locked positio
 
     // Setup I/O and interfaces
@@ -694,8 +692,7 @@ void setup() {
     }
 
     // Load PIN from preferences
-    unlockPin = loadPin();
-    Serial.println("Current PIN: " + unlockPin);
+    Serial.println("Current PIN: " + loadPin());
 
     // Initialize Blynk
     BlynkEdgent.begin();

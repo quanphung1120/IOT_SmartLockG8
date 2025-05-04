@@ -136,9 +136,10 @@ bool config_save() {
 
 bool pin_reset() {
     Preferences prefs;
-    if (prefs.begin("smartlock", false)) {    // writeable
-        prefs.putString("pin", DEFAULT_PIN);  // Reset to default PIN
+    if (prefs.begin("smartlock", false)) {
+        prefs.clear();
         DEBUG_PRINT("Pin reset to default pin");
+        prefs.end();
         return true;
     } else {
         DEBUG_PRINT("Config write failed");
