@@ -134,11 +134,24 @@ bool config_save() {
     }
 }
 
-bool pin_reset() {
+// bool pin_reset() {
+//     Preferences prefs;
+//     if (prefs.begin("smartlock", false)) {
+//         prefs.clear();
+//         DEBUG_PRINT("Pin reset to default pin");
+//         prefs.end();
+//         return true;
+//     } else {
+//         DEBUG_PRINT("Config write failed");
+//         return false;
+//     }
+// }
+
+bool flag_reset() {
     Preferences prefs;
     if (prefs.begin("smartlock", false)) {
-        prefs.clear();
-        DEBUG_PRINT("Pin reset to default pin");
+        prefs.putBool("flag_reset", true);
+        DEBUG_PRINT("The door's database is going to reset!");
         prefs.end();
         return true;
     } else {
@@ -155,8 +168,8 @@ bool config_init() {
 void enterResetConfig() {
     DEBUG_PRINT("Resetting configuration!");
     configStore = configDefault;
-    pin_reset();
     config_save();
+    flag_reset();
     BlynkState::set(MODE_WAIT_CONFIG);
 }
 

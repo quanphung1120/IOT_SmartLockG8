@@ -315,7 +315,6 @@ bool getFingerprintEnroll() {
         }
     }
 
-    // Process first image
     p = finger.image2Tz(1);
     if (p != FINGERPRINT_OK) {
         String errorMsg = "Processing failed";
@@ -341,7 +340,6 @@ bool getFingerprintEnroll() {
     delay(1000);
     p = 0;
 
-    // Wait for finger removal with timeout
     attemptCount = 0;
     while (p != FINGERPRINT_NOFINGER && attemptCount < MAX_ATTEMPTS) {
         p = finger.getImage();
@@ -356,12 +354,10 @@ bool getFingerprintEnroll() {
         }
     }
 
-    // Second fingerprint capture
     displayMessage("Place same", "finger again");
     Serial.println("Place same finger again for ID #" + String(id));
     p = -1;
 
-    // Second image capture with timeout
     attemptCount = 0;
     while (p != FINGERPRINT_OK && attemptCount < MAX_ATTEMPTS) {
         p = finger.getImage();
@@ -399,7 +395,6 @@ bool getFingerprintEnroll() {
         }
     }
 
-    // Process second image
     p = finger.image2Tz(2);
     if (p != FINGERPRINT_OK) {
         String errorMsg = "Processing failed";
@@ -702,7 +697,27 @@ void setup() {
                             &inputTaskHandle, 0);
 }
 
+void handleReset() {
+    Preferences prefs;
+    if (prefs.begin("smartlock", false)) {
+        if (prefs.getBool("reset", false)) {
+            prefs.remove("pin");
+            Serial.println("PIN removed from preferences");
+
+            finger.emptyDatabase();
+            Serial.println("Fingerprint database cleared");
+
+            prefs.putBool("reset", false);
+            Serial.println("Preferences reset to factory defaults");
+        }
+
+        prefs.end();
+    }
+    displayMessage("Factory Reset", "Done", 2000);
+}
+
 void loop() {
+    handleReset();  // Check for factory reset command
     BlynkEdgent.run();
     delay(1000);
 }
