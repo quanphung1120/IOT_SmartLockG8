@@ -69,12 +69,9 @@ unsigned long lastKeyPressTime = 0;
 
 unsigned long lastPinFailTime = 0;
 unsigned long lastFingerFailTime = 0;
-const unsigned long ATTEMPT_RESET_TIME = 120000;  // 2 minutes in milliseconds
-
-// Using atomic because this variable is accessed from multiple threads
+const unsigned long ATTEMPT_RESET_TIME = 120000;
 std::atomic<bool> isRegistering{false};
 
-// Display functions
 void displayUpdate(uint8_t col, uint8_t row, const String &text,
                    bool clearFirst = false) {
     std::lock_guard<std::mutex> lock(displayMutex);
@@ -98,13 +95,10 @@ void displayMessage(const String &line1, const String &line2 = "",
     if (displayTime > 0) delay(displayTime);
 }
 
-// Lock control functions
 unsigned long lastServoCommandTime = 0;
-const unsigned long SERVO_COMMAND_DEBOUNCE = 500;  // 500ms between commands
+const unsigned long SERVO_COMMAND_DEBOUNCE = 500;
 
-// Update setLockPosition
 void setLockPosition(bool lock) {
-    // Only move if state is changing
     if (isLocked != lock) {
         lockServo.write(lock ? LOCK_POSITION : UNLOCK_POSITION);
         isLocked = lock;
@@ -283,7 +277,6 @@ bool getFingerprintEnroll() {
     displayMessage("Enrolling ID #" + String(id), "Place finger");
     Serial.println("Waiting for valid finger to enroll as #" + String(id));
 
-    // First image capture
     attemptCount = 0;
     while (p != FINGERPRINT_OK && attemptCount < FINGER_ENROLL_ATTEMPTS) {
         p = finger.getImage();
@@ -429,7 +422,6 @@ bool getFingerprintEnroll() {
         return false;
     }
 
-    // Create model from two fingerprints
     displayMessage("Creating model", "Please wait");
     p = finger.createModel();
     if (p != FINGERPRINT_OK) {
@@ -441,7 +433,6 @@ bool getFingerprintEnroll() {
         return false;
     }
 
-    // Store the model
     displayMessage("Storing as ID #" + String(id), "Please wait");
     p = finger.storeModel(id);
     if (p == FINGERPRINT_OK) {
@@ -466,37 +457,30 @@ bool getFingerprintEnroll() {
 }
 
 bool handleFingerprint() {
-    // Early return for conditions that prevent fingerprint processing
     if (isRegistering.load() || !isLocked || isLockoutActive()) {
         return false;
     }
 
-    // First check if there's a finger
     int fingerID = getFingerprintIDez();
     if (fingerID == -1) {
-        return false;  // No finger detected
+        return false;
     }
 
-    // Show message once and wait for finger removal
     displayMessage("Remove your", "finger to process");
     while (finger.getImage() != FINGERPRINT_NOFINGER) {
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 
-    // Process result
     if (fingerID > 0) {
-        // Success - valid fingerprint
         fingerFailedAttempts = 0;
         displayMessage("Access Granted!", "Door Unlocked", 2000);
         unlockTemporarily();
         sendBlynkEvent("access_granted", "Access granted via fingerprint");
         return true;
     } else if (fingerID == -2) {
-        // Failed match
         fingerFailedAttempts++;
         lastFingerFailTime = millis();
 
-        // Handle too many failed attempts
         if (fingerFailedAttempts >= 5) {
             sendBlynkEvent("send_alarm", "Access denied, too many attempts");
             displayMessage("Too Many Attempts", "Locking out", 2000);
@@ -524,7 +508,6 @@ void blynkVirtualWrite(const int pin, String value) {
 
 const unsigned long MOTION_DEBOUNCE = 80;
 
-// Main input task
 void inputTask(void *parameter) {
     unsigned long lastMotionTime = 0;
 
@@ -655,7 +638,7 @@ BLYNK_WRITE(V1) {
     resetPasscodeEntry();
 }
 
-const unsigned long FINGERPRINT_REGISTER_COOLDOWN = 60000;  // 60 seconds
+const unsigned long FINGERPRINT_REGISTER_COOLDOWN = 60000;
 unsigned long lastRegistrationAttempt = 0;
 
 BLYNK_WRITE(V2) {
@@ -684,7 +667,6 @@ BLYNK_WRITE(V2) {
         bool success = getFingerprintEnroll();
         isRegistering = false;
 
-        // Apply cooldown regardless of success or failure
         lastRegistrationAttempt = millis();
 
         if (success) {
@@ -744,12 +726,10 @@ BLYNK_WRITE(V6) {
                     break;
             }
 
-            // Send detailed error to Blynk app
             blynkVirtualWrite(V5, errorMsg);
             Serial.println(errorMsg);
         }
     } else {
-        // Invalid ID handling
         displayMessage("Invalid ID", "Try again", 2000);
         blynkVirtualWrite(V5, "Invalid fingerprint ID: must be greater than 0");
     }
