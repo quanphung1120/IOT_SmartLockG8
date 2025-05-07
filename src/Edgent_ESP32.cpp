@@ -58,6 +58,7 @@ String currentPasscode = "";
 
 int pinFailedAttempts = 0;
 int fingerFailedAttempts = 0;
+const int FINGER_ENROLL_ATTEMPTS = 3;
 bool isLocked = true;
 bool backlightEnabled = true;
 bool autoLockPending = false;
@@ -233,18 +234,23 @@ bool handleKeypadInput() {
     return false;
 }
 
-// Fingerprint functions
+bool isFingerprintExist(int id) {
+    uint8_t p = finger.loadModel(id);
+    return p == FINGERPRINT_OK;
+}
+
 uint8_t findAvailableFingerID() {
     finger.getTemplateCount();
 
     for (uint8_t id = 1; id < 128; id++) {
-        uint8_t p = finger.fingerSearch(id);
-        if (p == FINGERPRINT_NOTFOUND) {
-            return id;  // This ID is available
+        uint8_t p = finger.loadModel(id);
+        Serial.println("ID: " + String(id) + " - " + String(p));
+        if (!isFingerprintExist(id)) {
+            return id;
         }
     }
 
-    return 0;  // No available IDs
+    return 0;
 }
 
 int getFingerprintIDez() {
@@ -268,7 +274,6 @@ bool getFingerprintEnroll() {
     int p = -1;
     int id = findAvailableFingerID();
     int attemptCount = 0;
-    const int MAX_ATTEMPTS = 5;
 
     if (id == 0) {
         displayMessage("No free slots", "Clear database first", 2000);
@@ -278,8 +283,9 @@ bool getFingerprintEnroll() {
     displayMessage("Enrolling ID #" + String(id), "Place finger");
     Serial.println("Waiting for valid finger to enroll as #" + String(id));
 
+    // First image capture
     attemptCount = 0;
-    while (p != FINGERPRINT_OK && attemptCount < MAX_ATTEMPTS) {
+    while (p != FINGERPRINT_OK && attemptCount < FINGER_ENROLL_ATTEMPTS) {
         p = finger.getImage();
         switch (p) {
             case FINGERPRINT_OK:
@@ -309,7 +315,7 @@ bool getFingerprintEnroll() {
                 break;
         }
 
-        if (attemptCount >= MAX_ATTEMPTS) {
+        if (attemptCount >= FINGER_ENROLL_ATTEMPTS) {
             displayMessage("Too many errors", "Registration canceled", 2000);
             return false;
         }
@@ -334,21 +340,30 @@ bool getFingerprintEnroll() {
         return false;
     }
 
-    // Wait for finger removal
+    p = finger.fingerFastSearch();
+    if (p == FINGERPRINT_OK) {
+        displayMessage("Already exists", "ID #" + String(finger.fingerID),
+                       2000);
+        Serial.println("Fingerprint already exists with ID #" +
+                       String(finger.fingerID));
+        return false;
+    }
+    Serial.println("No duplicate found, continuing enrollment");
+
     displayMessage("Remove finger", "from sensor");
     Serial.println("Remove finger");
     delay(1000);
     p = 0;
 
     attemptCount = 0;
-    while (p != FINGERPRINT_NOFINGER && attemptCount < MAX_ATTEMPTS) {
+    while (p != FINGERPRINT_NOFINGER && attemptCount < FINGER_ENROLL_ATTEMPTS) {
         p = finger.getImage();
         if (p != FINGERPRINT_NOFINGER) {
             delay(1000);
             attemptCount++;
         }
 
-        if (attemptCount >= MAX_ATTEMPTS) {
+        if (attemptCount >= FINGER_ENROLL_ATTEMPTS) {
             displayMessage("Finger not removed", "Registration canceled", 2000);
             return false;
         }
@@ -359,7 +374,7 @@ bool getFingerprintEnroll() {
     p = -1;
 
     attemptCount = 0;
-    while (p != FINGERPRINT_OK && attemptCount < MAX_ATTEMPTS) {
+    while (p != FINGERPRINT_OK && attemptCount < FINGER_ENROLL_ATTEMPTS) {
         p = finger.getImage();
         switch (p) {
             case FINGERPRINT_OK:
@@ -389,7 +404,7 @@ bool getFingerprintEnroll() {
                 break;
         }
 
-        if (attemptCount >= MAX_ATTEMPTS) {
+        if (attemptCount >= FINGER_ENROLL_ATTEMPTS) {
             displayMessage("Too many errors", "Registration canceled", 2000);
             return false;
         }
@@ -507,8 +522,12 @@ void blynkVirtualWrite(const int pin, String value) {
     }
 }
 
+const unsigned long MOTION_DEBOUNCE = 80;
+
 // Main input task
 void inputTask(void *parameter) {
+    unsigned long lastMotionTime = 0;
+
     int fingerScanCounter = 0;
     int pinStateCurrent = digitalRead(MOVEMENT_PIN);
     int pinStatePrevious = pinStateCurrent;
@@ -516,9 +535,9 @@ void inputTask(void *parameter) {
     bool wasLocked = false;
 
     for (;;) {
+        unsigned long currentTime = millis();
         if (isLockoutActive()) {
             wasLocked = true;
-            unsigned long currentTime = millis();
             unsigned long remainingSecs = (lockoutUntil - currentTime) / 1000;
             displayMessage("System Locked",
                            String(remainingSecs) + "s remaining");
@@ -528,26 +547,23 @@ void inputTask(void *parameter) {
         }
 
         if (wasLocked) {
-            // Just transitioned from locked to unlocked - update display
             wasLocked = false;
             displayMessage("Lockout Ended", "System Available", 2000);
-            resetPasscodeEntry();  // This will show the "Enter Passcode" screen
+            resetPasscodeEntry();
         }
 
         if (autoLockPending) {
-            unsigned long currentTime = millis();
-
             pinStatePrevious = pinStateCurrent;
             pinStateCurrent = digitalRead(MOVEMENT_PIN);
 
-            if (pinStatePrevious == LOW && pinStateCurrent == HIGH) {
+            if (pinStatePrevious == LOW && pinStateCurrent == HIGH &&
+                (currentTime - lastMotionTime > MOTION_DEBOUNCE)) {
+                lastMotionTime = currentTime;
                 Serial.println("Motion detected!");
                 autoLockTime = currentTime + UNLOCK_DURATION;
-                delay(200);  // Debounce delay
             }
 
             if (currentTime >= autoLockTime) {
-                // Time to lock
                 setLockPosition(true);
                 autoLockPending = false;
                 displayMessage("Door Locked", "Auto-lock complete", 1000);
@@ -592,7 +608,6 @@ void inputTask(void *parameter) {
     }
 }
 
-// Blynk handlers
 BLYNK_WRITE(V0) {
     if (param.asInt()) {
         displayMessage("Door Unlocked", "Blynk Command");
@@ -602,27 +617,66 @@ BLYNK_WRITE(V0) {
     }
 }
 
+const unsigned long PIN_CHANGE_COOLDOWN = 15000;
+unsigned long lastPinChangeAttempt = 0;
+
 BLYNK_WRITE(V1) {
     String newPin = param.asStr();
+    unsigned long currentTime = millis();
+
+    if (lastPinChangeAttempt > 0 &&
+        currentTime - lastPinChangeAttempt < PIN_CHANGE_COOLDOWN) {
+        int remainingSeconds =
+            (PIN_CHANGE_COOLDOWN - (currentTime - lastPinChangeAttempt)) / 1000;
+
+        String message = "Please wait " + String(remainingSeconds) +
+                         " seconds before changing PIN again";
+        blynkVirtualWrite(V3, message);
+        displayMessage("PIN Change Limit",
+                       "Wait " + String(remainingSeconds) + "s", 2000);
+        return;
+    }
+
+    lastPinChangeAttempt = currentTime;
 
     if (!isValidPin(newPin)) {
-        // return the message to blynk app
+        blynkVirtualWrite(V3, "Invalid PIN format, please try again");
         return;
     }
 
     if (savePin(newPin)) {
         displayMessage("PIN Changed", "Successfully", 4000);
-        blynkVirtualWrite(V3, "Pin changed successfully");
+        blynkVirtualWrite(V3, "PIN changed successfully");
     } else {
         displayMessage("PIN Change", "Failed", 3000);
-        blynkVirtualWrite(V3, "Pin changed failed");
+        blynkVirtualWrite(V3, "PIN change failed");
     }
+
     resetPasscodeEntry();
 }
+
+const unsigned long FINGERPRINT_REGISTER_COOLDOWN = 60000;  // 60 seconds
+unsigned long lastRegistrationAttempt = 0;
 
 BLYNK_WRITE(V2) {
     if (param.asInt()) {
         if (isRegistering) {
+            blynkVirtualWrite(V4, "Registration already in progress");
+            return;
+        }
+
+        unsigned long currentTime = millis();
+        if (lastRegistrationAttempt > 0 &&
+            currentTime - lastRegistrationAttempt <
+                FINGERPRINT_REGISTER_COOLDOWN) {
+            int remainingSeconds = (FINGERPRINT_REGISTER_COOLDOWN -
+                                    (currentTime - lastRegistrationAttempt)) /
+                                   1000;
+
+            String message = "Please wait " + String(remainingSeconds) +
+                             " seconds before registering again";
+
+            blynkVirtualWrite(V4, message);
             return;
         }
 
@@ -630,14 +684,21 @@ BLYNK_WRITE(V2) {
         bool success = getFingerprintEnroll();
         isRegistering = false;
 
+        // Apply cooldown regardless of success or failure
+        lastRegistrationAttempt = millis();
+
         if (success) {
-            displayMessage("Registration", "Successfully", 2000);
+            displayMessage("Registration", "Successful", 2000);
             blynkVirtualWrite(V4, "Fingerprint registered successfully");
+
+            finger.getTemplateCount();
+            blynkVirtualWrite(
+                V5, String(finger.templateCount) + " fingerprints now stored");
         } else {
             displayMessage("Registration", "Failed", 2000);
-            blynkVirtualWrite(V4, "Fingerprint registration failed");
+            blynkVirtualWrite(
+                V4, "Fingerprint registration failed - try again in 60s");
         }
-
         resetPasscodeEntry();
     }
 }
@@ -645,17 +706,65 @@ BLYNK_WRITE(V2) {
 BLYNK_WRITE(V6) {
     int id = param.asInt();
     if (id > 0) {
-        if (finger.deleteModel(id) == FINGERPRINT_OK) {
+        if (!isFingerprintExist(id)) {
+            displayMessage("ID #" + String(id), "not found", 2000);
+            blynkVirtualWrite(
+                V5, "Fingerprint ID #" + String(id) + " not found in database");
+            return;
+        }
+
+        uint8_t result = finger.deleteModel(id);
+        if (result == FINGERPRINT_OK) {
             displayMessage("Fingerprint", "Deleted", 2000);
-            blynkVirtualWrite(V5, "Fingerprint deleted successfully");
+            finger.getTemplateCount();
+
+            String detailedMsg =
+                "Fingerprint ID #" + String(id) + " successfully deleted";
+            detailedMsg +=
+                " (" + String(finger.templateCount) + " fingerprints stored)";
+
+            blynkVirtualWrite(V5, detailedMsg);
+            Serial.println(detailedMsg);
         } else {
             displayMessage("Delete Failed", "Try again", 2000);
-            blynkVirtualWrite(V5, "Fingerprint deletion failed");
+            String errorMsg = "Failed to delete ID #" + String(id) + ": ";
+
+            switch (result) {
+                case FINGERPRINT_PACKETRECIEVEERR:
+                    errorMsg += "Communication error with sensor";
+                    break;
+                case FINGERPRINT_BADLOCATION:
+                    errorMsg += "ID does not exist in database";
+                    break;
+                case FINGERPRINT_FLASHERR:
+                    errorMsg += "Flash memory write error";
+                    break;
+                default:
+                    errorMsg += "Error code " + String(result);
+                    break;
+            }
+
+            // Send detailed error to Blynk app
+            blynkVirtualWrite(V5, errorMsg);
+            Serial.println(errorMsg);
         }
     } else {
+        // Invalid ID handling
         displayMessage("Invalid ID", "Try again", 2000);
+        blynkVirtualWrite(V5, "Invalid fingerprint ID: must be greater than 0");
     }
     resetPasscodeEntry();
+}
+
+BLYNK_WRITE(V7) {
+    if (param.asInt()) {
+        if (isLocked) {
+            blynkVirtualWrite(V8, "Door already locked");
+        } else {
+            autoLockTime = 0;
+            blynkVirtualWrite(V8, "Door locked successfully");
+        }
+    }
 }
 
 void setup() {
@@ -667,9 +776,9 @@ void setup() {
     displayMessage("Initializing...", "Please wait");
 
     // Setup servo
-    lockServo.attach(SERVO_PIN);     // Min/Max pulse width
-    delay(1000);                     // Allow time for servo to initialize
-    lockServo.write(LOCK_POSITION);  // Start in locked positio
+    lockServo.attach(SERVO_PIN);
+    delay(1000);
+    lockServo.write(LOCK_POSITION);
 
     // Setup I/O and interfaces
     pinMode(MOVEMENT_PIN, INPUT);
@@ -695,29 +804,65 @@ void setup() {
     // Create input handling task
     xTaskCreatePinnedToCore(inputTask, "InputTask", 4096, NULL, 1,
                             &inputTaskHandle, 0);
+
+    currentPasscode.reserve(PASSCODE_LENGTH + 1);
 }
 
 void handleReset() {
     Preferences prefs;
     if (prefs.begin("smartlock", false)) {
-        if (prefs.getBool("reset", false)) {
+        if (prefs.getBool("flag_reset", false)) {
             prefs.remove("pin");
             Serial.println("PIN removed from preferences");
+            displayMessage("PIN Reset", "Done", 2000);
 
             finger.emptyDatabase();
             Serial.println("Fingerprint database cleared");
+            displayMessage("Fingerprint DB", "Cleared", 2000);
 
-            prefs.putBool("reset", false);
-            Serial.println("Preferences reset to factory defaults");
+            prefs.putBool("flag_reset", false);
+            Serial.println("Reset to factory defaults");
+
+            displayMessage("Factory Reset", "Done", 4000);
+            resetPasscodeEntry();
         }
 
         prefs.end();
     }
-    displayMessage("Factory Reset", "Done", 2000);
 }
 
 void loop() {
-    handleReset();  // Check for factory reset command
+    handleReset();
+
+    static unsigned long lastMemReport = 0;
+    static unsigned long lastHeapCheck = 0;
+    unsigned long now = millis();
+
+    // Debug memory - written by Claude AI
+    if (now - lastMemReport > 30000) {
+        Serial.println("---------------------------------");
+        Serial.println("Memory report:");
+        Serial.printf("Free heap: %d bytes, Largest block: %d bytes\n",
+                      ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        lastMemReport = now;
+        Serial.printf("Task Count: %u\n", uxTaskGetNumberOfTasks());
+
+        Serial.printf("Input Task Stack HWM: %u\n",
+                      uxTaskGetStackHighWaterMark(inputTaskHandle));
+        Serial.println("---------------------------------");
+    }
+
+    if (now - lastHeapCheck > 10000) {  // Check every 10 seconds
+        lastHeapCheck = now;
+        if (ESP.getFreeHeap() < 10000) {  // Critical threshold
+            Serial.println("WARNING: Low memory detected");
+            // Optional: Take recovery action or restart
+            // ESP.restart();
+        }
+    }
+
+    // End debug memory
+
     BlynkEdgent.run();
     delay(1000);
 }
