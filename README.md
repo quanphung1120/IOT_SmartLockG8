@@ -1,11 +1,31 @@
 # IOT_SmartLockG8
 
-IOT_SmartLockG8 is a project designed to implement a smart lock system using IoT technology. Built primarily with C++ and C, the project leverages embedded systems to provide secure and efficient access control. The repository includes features such as hardware integration, communication protocols, and a modular design for easy customization and scalability.
+A smart lock project leveraging IoT (Internet of Things) principles. This repository demonstrates how embedded systems and connected devices can be used to build a secure, remote-controllable locking mechanism which was submitted as an final assignment for my IoT102 subject at FPT University.
 
-Key Features:
+## Features
 
-IoT Integration: Connect and manage the smart lock remotely.
-Embedded System Design: Developed using C++ and C for optimal performance.
-Customizable: Designed with modularity for added flexibility.
-Secure Access Control: Ensures reliable security mechanisms.
-This project is ideal for developers and enthusiasts interested in IoT applications and embedded systems.
+- **Remote Lock/Unlock:** Control the lock from a connected device or remotely via network protocols.
+- **Availability while offline:** System ensures smooth users' experience even if the microcontroller is disconnected from WiFi by leveraging multi-core architecture of ESP-32
+- **Embedded System:** Runs on microcontroller hardware with efficient C++ code.
+- **Security:** Implements basic security features for safe operation.
+
+## Technologies & Hardware Used
+
+This project combines several modern technologies and concepts:
+
+- **C++ Programming Language:**  
+  The core logic is written in C++, ideal for embedded systems due to its efficiency, low-level hardware access, and real-time performance.
+- **ESP32 (Multi-core Architecture):**  
+  The ESP32 microcontroller with 2 dedicated cores provides smooth experience to users.
+- **Blynk Edgent:**  
+  Enables cloud connectivity and remote device management, making it easy to control the lock from anywhere.
+- **AS608 Fingerprint Sensor:**  
+  Provides secure biometric authentication for unlocking.
+- **HC-SR501 PIR Motion Sensor:**  
+  Detects motion to improve user experience.
+- **Keypad 4x4:**  
+  Offers an alternative method for user input and authentication.
+- **IoT Networking:**  
+  System can communicate with Blynk's servers and end-users over Wi-Fi.
+- **Sensor & Actuator Integration:**  
+  The hardware works with sensors and actuators to physically manage the locking mechanism.
