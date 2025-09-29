@@ -18,7 +18,7 @@ This project combines several modern technologies and concepts:
 - **ESP32 (Multi-core Architecture):**  
   The ESP32 microcontroller with 2 dedicated cores provides smooth experience to users.
 - **Blynk Edgent:**  
-  Enables cloud connectivity and remote device management, making it easy to control the lock from anywhere.
+  It enables cloud connectivity and remote device management, allowing users to control the lock from anywhere. In addition, the Edgent package provides Wi-Fi provisioning functionality, making it possible to set up the demonstration project just like a real product.
 - **AS608 Fingerprint Sensor:**  
   Provides secure biometric authentication for unlocking.
 - **HC-SR501 PIR Motion Sensor:**  
